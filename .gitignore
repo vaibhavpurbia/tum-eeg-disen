@@ -2,4 +2,4 @@
 __pycache__/
 *.pyc
 .vscode/
-*.npy
+sample_clean_epoch.npy

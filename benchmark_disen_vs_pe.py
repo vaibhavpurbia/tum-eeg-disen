@@ -5,12 +5,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import butter, sosfiltfilt, iirnotch, filtfilt
 from scipy.special import ndtr
-from scipy.stats import spearmanr, wilcoxon
+from scipy.stats import spearmanr
 from numpy.lib.stride_tricks import sliding_window_view
 import vitaldb
 
 # =====================================================================
-# 1. IDENTICAL PREPROCESSING FROM STEP 4 (Bandpass + 50 Hz Notch)
+# 1. FILTERING & SIGNAL PROCESSING
 # =====================================================================
 
 def apply_bandpass(data, fs=128.0, lowcut=0.5, highcut=30.0, order=4):
@@ -22,22 +22,36 @@ def apply_notch(data, fs=128.0, notch_freq=50.0, Q=30.0):
     padlen = min(150, len(data) - 1)
     return filtfilt(b, a, data, padlen=padlen)
 
+def compute_sef95(x, fs=128.0, f_max=30.0):
+    """Computes the 95% Spectral Edge Frequency (SEF95)."""
+    N = len(x)
+    freqs = np.fft.rfftfreq(N, d=1/fs)
+    fft_vals = np.fft.rfft(x)
+    psd = (np.abs(fft_vals) ** 2) / (fs * N)
+    
+    valid_mask = (freqs >= 0.5) & (freqs <= f_max)
+    f_sub = freqs[valid_mask]
+    p_sub = psd[valid_mask]
+    
+    cum_power = np.cumsum(p_sub)
+    total_power = cum_power[-1]
+    if total_power <= 0:
+        return 0.0
+    
+    idx_95 = np.where(cum_power >= 0.95 * total_power)[0]
+    return float(f_sub[idx_95[0]]) if len(idx_95) > 0 else 0.0
+
 # =====================================================================
-# 2. COMPLEXITY METRICS: DisEn (m=3, c=4, d=1) vs. PE (m=3, d=1)
+# 2. COMPLEXITY METRICS: DispEn, PeEn, SampEn
 # =====================================================================
 
-def compute_disen(x: np.ndarray, m: int = 3, c: int = 4, d: int = 1) -> float:
-    """
-    Normalized Dispersion Entropy (Rostaghi & Azami, 2016).
-    Matches step4_stratified_batch.py exactly using fast C-level ndtr.
-    Time Complexity: O(N)
-    """
+def compute_dispen(x: np.ndarray, m: int = 3, c: int = 4, d: int = 1) -> float:
+    """Normalized Dispersion Entropy (Rostaghi & Azami, 2016)."""
     N = len(x)
     sigma = np.std(x)
     if sigma < 1e-12:
         return 0.0
-    mu = np.mean(x)
-    y = ndtr((x - mu) / sigma)
+    y = ndtr((x - np.mean(x)) / sigma)
     z = np.clip(np.round(c * y + 0.5).astype(np.int32), 1, c)
     
     num_vectors = N - (m - 1) * d
@@ -50,28 +64,51 @@ def compute_disen(x: np.ndarray, m: int = 3, c: int = 4, d: int = 1) -> float:
     return float(-np.sum(p * np.log(p)) / np.log(c**m))
 
 
-def compute_pe(x: np.ndarray, m: int = 3, d: int = 1) -> float:
-    """
-    Normalized Permutation Entropy (Bandt & Pompe, 2002).
-    Time Complexity: O(N * m log m)
-    """
+def compute_peen(x: np.ndarray, m: int = 3, d: int = 1) -> float:
+    """Normalized Permutation Entropy (Bandt & Pompe, 2002)."""
     if np.std(x) < 1e-12:
         return 0.0
-    
     windows = sliding_window_view(x, window_shape=(m - 1) * d + 1)[:, ::d]
     ranks = np.argsort(windows, axis=1, kind='mergesort')
-    
     powers = m ** np.arange(m - 1, -1, -1, dtype=np.int32)
     pattern_ids = ranks @ powers
     
     counts = np.bincount(pattern_ids, minlength=m**m)
     p = counts[counts > 0] / len(pattern_ids)
-    
     norm_factor = np.log(6.0) if m == 3 else np.sum(np.log(np.arange(1, m + 1)))
     return float(-np.sum(p * np.log(p)) / norm_factor)
 
+
+def compute_sampen(x: np.ndarray, m: int = 2, r_factor: float = 0.2) -> float:
+    """Sample Entropy (Richman & Moorman, 2000)."""
+    x = np.asarray(x)
+    N = len(x)
+    r = r_factor * np.std(x)
+    if r == 0 or N <= m + 1:
+        return 0.0
+
+    def _max_dist(x_i, x_j, m_val):
+        return max([abs(x_i[k] - x_j[k]) for k in range(m_val)])
+
+    def _phi(m_val):
+        embeddings = np.array([x[i:i + m_val] for i in range(N - m_val + 1)])
+        count = 0
+        num_vecs = len(embeddings)
+        for i in range(num_vecs):
+            # count matches excluding self-matches to avoid bias
+            matches = sum(1 for j in range(num_vecs) if i != j and _max_dist(embeddings[i], embeddings[j], m_val) <= r)
+            count += matches
+        return count
+
+    phi_m = _phi(m)
+    phi_m1 = _phi(m + 1)
+    
+    if phi_m == 0 or phi_m1 == 0:
+        return 0.0
+    return float(-np.log(phi_m1 / phi_m))
+
 # =====================================================================
-# 3. SMITH'S PREDICTION PROBABILITY (P_K)
+# 3. STATISTICAL EVALUATION WITH BOOTSTRAPPED 95% CI FOR P_K
 # =====================================================================
 
 def compute_pk(metric_vals: np.ndarray, target_vals: np.ndarray) -> float:
@@ -96,8 +133,19 @@ def compute_pk(metric_vals: np.ndarray, target_vals: np.ndarray) -> float:
     pk = (concordant + 0.5 * tied_m) / total
     return max(pk, 1.0 - pk)
 
+
+def bootstrap_pk(metric_vals: np.ndarray, target_vals: np.ndarray, n_boot: int = 1000) -> tuple:
+    """Computes 95% confidence intervals for P_K via bootstrap resampling."""
+    n = len(metric_vals)
+    pk_boot = []
+    rng = np.random.default_rng(42)
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        pk_boot.append(compute_pk(metric_vals[idx], target_vals[idx]))
+    return float(np.mean(pk_boot)), float(np.percentile(pk_boot, 2.5)), float(np.percentile(pk_boot, 97.5))
+
 # =====================================================================
-# 4. VITALDB EPISODE EXTRACTION (FROM STEP 4)
+# 4. VITALDB EPISODE EXTRACTION
 # =====================================================================
 
 def find_all_stable_episodes(mac_clean, min_samples=300, max_delta=0.05):
@@ -128,13 +176,14 @@ def find_all_stable_episodes(mac_clean, min_samples=300, max_delta=0.05):
 
 
 def extract_case_episodes(caseid, fs=128):
-    tracks = ['Primus/MAC', 'BIS/BIS']
+    tracks = ['Primus/MAC', 'BIS/BIS', 'BIS/SEF']
     data = vitaldb.vital_recs(ipath=int(caseid), track_names=tracks, interval=1.0)
     if data is None or len(data) == 0:
         return []
     df_track = pd.DataFrame(data, columns=tracks).bfill().ffill()
     mac_clean = df_track['Primus/MAC'].values
     bis_clean = df_track['BIS/BIS'].values
+    sef_clean = df_track['BIS/SEF'].values if 'BIS/SEF' in df_track else np.full_like(bis_clean, np.nan)
     
     episodes = find_all_stable_episodes(mac_clean, min_samples=300, max_delta=0.05)
     if not episodes:
@@ -146,6 +195,8 @@ def extract_case_episodes(caseid, fs=128):
         
     valid_extracted = []
     for (start, end, mean_mac) in episodes:
+        if mean_mac > 2.0:  
+            continue
         center_sec = (start + end) // 2
         s_idx = int((center_sec - 10) * fs)
         e_idx = int((center_sec + 10) * fs)
@@ -155,21 +206,28 @@ def extract_case_episodes(caseid, fs=128):
         if np.isnan(epoch).any() or np.max(np.abs(epoch)) >= 100.0 or (np.sum(np.abs(epoch) < 5.0) / len(epoch)) >= 0.05:
             continue
         bis_val = bis_clean[center_sec] if not np.isnan(bis_clean[center_sec]) else None
-        valid_extracted.append({'mac': mean_mac, 'bis': bis_val, 'epoch': epoch})
+        sef_val = sef_clean[center_sec] if not np.isnan(sef_clean[center_sec]) else None
+        valid_extracted.append({'mac': mean_mac, 'bis': bis_val, 'sef': sef_val, 'epoch': epoch})
     return valid_extracted
 
 # =====================================================================
-# 5. MAIN HEAD-TO-HEAD BENCHMARK ON THE 25 STRATIFIED COHORT EPOCHS
+# 5. MAIN EXECUTION & REPOSITORY EXPORT
 # =====================================================================
 
 if __name__ == '__main__':
     df_strat = pd.read_csv("data/stratified_cohort.csv")
+    # Filter out MAC > 2.0
+    df_strat = df_strat[df_strat['mac'] <= 2.0].reset_index(drop=True)
     unique_cases = sorted(df_strat['caseid'].unique())
-    print(f"[*] Loaded 'data/stratified_cohort.csv' ({len(df_strat)} plateaus across {len(unique_cases)} unique cases).")
-    print(f"[*] Re-fetching exact 20s EEG epochs for cases: {unique_cases}...\n")
+    
+    print(f"[*] Loaded filtered cohort ({len(df_strat)} plateaus across {len(unique_cases)} cases, MAC <= 2.0).")
+    print(f"[*] Re-fetching exact 20s EEG epochs for repository export...\n")
 
     epochs_30 = [None] * len(df_strat)
     epochs_40 = [None] * len(df_strat)
+    raw_epochs_list = []
+
+    os.makedirs("data/raw_reproducible_epochs", exist_ok=True)
 
     for cid in unique_cases:
         eps = extract_case_episodes(cid, fs=128)
@@ -177,110 +235,78 @@ if __name__ == '__main__':
         
         for ep in eps:
             s30 = apply_notch(apply_bandpass(ep['epoch'], 128, 0.5, 30.0), 128)
-            d30 = compute_disen(s30, m=3, c=4, d=1)
+            d30 = compute_dispen(s30, m=3, c=4, d=1)
             
-            # Match against exact row in stratified_cohort.csv
             for idx, row in sub_df.iterrows():
                 if epochs_30[idx] is None and np.isclose(d30, row['disen_30'], atol=1e-5):
                     s40 = apply_notch(apply_bandpass(ep['epoch'], 128, 0.5, 40.0), 128)
                     epochs_30[idx] = s30
                     epochs_40[idx] = s40
-                    print(f"  Matched Row {idx:2d} | Case {cid:4d} ({row['tier']:6s}) | MAC={row['mac']:.2f} | DisEn_30={d30:.4f}")
+                    
+                    # Save individual reproducible numpy file for GitHub repository
+                    epoch_filename = f"data/raw_reproducible_epochs/case_{cid}_plateau_{idx}.npy"
+                    np.save(epoch_filename, ep['epoch'])
+                    raw_epochs_list.append({
+                        'caseid': cid,
+                        'plateau_idx': idx,
+                        'tier': row['tier'],
+                        'mac': row['mac'],
+                        'bis': row['bis'],
+                        'file_path': epoch_filename
+                    })
+                    print(f"  Matched & Exported Row {idx:2d} | Case {cid:4d} ({row['tier']:6s}) | MAC={row['mac']:.2f}")
                     break
 
-    # Verify all 25 epochs were matched
     assert all(x is not None for x in epochs_30), "Some epochs failed to match!"
 
-    # Compute DisEn and PE (m=3, d=1) + time execution over 200 iterations for high precision
-    n_repeats = 200
-    t0 = time.perf_counter()
-    for _ in range(n_repeats):
-        disen_30_vals = np.array([compute_disen(s, m=3, c=4, d=1) for s in epochs_30])
-    disen_ms = ((time.perf_counter() - t0) / (n_repeats * len(epochs_30))) * 1000.0
-    disen_40_vals = np.array([compute_disen(s, m=3, c=4, d=1) for s in epochs_40])
+    # Save repository manifest mapping metadata to raw arrays
+    df_manifest = pd.DataFrame(raw_epochs_list)
+    df_manifest.to_csv("data/raw_reproducible_epochs/manifest.csv", index=False)
 
-    t0 = time.perf_counter()
-    for _ in range(n_repeats):
-        pe_30_vals = np.array([compute_pe(s, m=3, d=1) for s in epochs_30])
-    pe_ms = ((time.perf_counter() - t0) / (n_repeats * len(epochs_30))) * 1000.0
-    pe_40_vals = np.array([compute_pe(s, m=3, d=1) for s in epochs_40])
+    # Compute metrics across all valid epochs
+    print("\n[*] Computing DispEn, PeEn, SampEn, and SEF95...")
+    disp_30_vals = np.array([compute_dispen(s, m=3, c=4, d=1) for s in epochs_30])
+    peen_30_vals = np.array([compute_peen(s, m=3, d=1) for s in epochs_30])
+    samp_30_vals = np.array([compute_sampen(s, m=2, r_factor=0.2) for s in epochs_30])
+    sef_30_vals  = np.array([compute_sef95(s, fs=128.0, f_max=30.0) for s in epochs_30])
 
-    # Save enriched CSV
-    df_strat['pe_30'] = pe_30_vals
-    df_strat['pe_40'] = pe_40_vals
-    df_strat['delta_pe'] = pe_40_vals - pe_30_vals
-    df_strat.to_csv("data/stratified_cohort_with_pe.csv", index=False)
+    disp_40_vals = np.array([compute_dispen(s, m=3, c=4, d=1) for s in epochs_40])
+    peen_40_vals = np.array([compute_peen(s, m=3, d=1) for s in epochs_40])
 
-    # Statistical Benchmarking
+    # Enriched DataFrame export
+    df_strat['disp_30'] = disp_30_vals
+    df_strat['peen_30'] = peen_30_vals
+    df_strat['samp_30'] = samp_30_vals
+    df_strat['sef95_30'] = sef_30_vals
+    df_strat.to_csv("data/stratified_cohort_fully_enriched.csv", index=False)
+
+    # Statistical Evaluation & Bootstrapped CI
     mac = df_strat['mac'].values
-    valid_bis_mask = (df_strat['bis'].notna()) & (df_strat['bis'] > 0)
+    valid_bis_mask = df_strat['bis'].notna() & (df_strat['bis'] > 0)
     bis_valid = df_strat.loc[valid_bis_mask, 'bis'].values
 
-    pk_disen_mac = compute_pk(disen_30_vals, mac)
-    pk_pe_mac    = compute_pk(pe_30_vals, mac)
-    pk_bis_mac   = compute_pk(bis_valid, mac[valid_bis_mask])
+    pk_disp, ci_disp_l, ci_disp_u = bootstrap_pk(disp_30_vals, mac)
+    pk_peen, ci_peen_l, ci_peen_u = bootstrap_pk(peen_30_vals, mac)
+    pk_samp, ci_samp_l, ci_samp_u = bootstrap_pk(samp_30_vals, mac)
+    pk_bis,  ci_bis_l,  ci_bis_u  = bootstrap_pk(bis_valid, mac[valid_bis_mask])
 
-    rho_disen_mac, p_disen_mac = spearmanr(mac, disen_30_vals)
-    rho_pe_mac,    p_pe_mac    = spearmanr(mac, pe_30_vals)
+    rho_disp_mac, p_disp_mac = spearmanr(mac, disp_30_vals)
+    rho_peen_mac, p_peen_mac = spearmanr(mac, peen_30_vals)
+    rho_samp_mac, p_samp_mac = spearmanr(mac, samp_30_vals)
 
-    rho_disen_bis, p_disen_bis = spearmanr(bis_valid, disen_30_vals[valid_bis_mask])
-    rho_pe_bis,    p_pe_bis    = spearmanr(bis_valid, pe_30_vals[valid_bis_mask])
+    rho_disp_bis, p_disp_bis = spearmanr(bis_valid, disp_30_vals[valid_bis_mask])
 
-    emg_disen = disen_40_vals - disen_30_vals
-    emg_pe    = pe_40_vals - pe_30_vals
+    emg_disp = disp_40_vals - disp_30_vals
+    emg_peen = peen_40_vals - peen_30_vals
 
-    print("\n" + "=" * 95)
-    print("HEAD-TO-HEAD BENCHMARK ON VITALDB STRATIFIED COHORT (N = 25 STEADY-STATE PLATEAUS, 20s @ 128Hz)")
-    print("=" * 95)
-    print(f"{'Metric (0.5-30 Hz)':<24} | {'P_K (MAC)':<10} | {'Spearman r (MAC)':<19} | {'Spearman r (BIS)':<19} | {'Speed (ms/ep)'}")
-    print("-" * 95)
-    print(f"{'DisEn (m=3, c=4, d=1)':<24} | {pk_disen_mac:<10.3f} | {rho_disen_mac:+.3f} (p={p_disen_mac:.4f}) | {rho_disen_bis:+.3f} (p={p_disen_bis:.4f}) | {disen_ms:.3f} ms")
-    print(f"{'PE    (m=3, d=1)':<24} | {pk_pe_mac:<10.3f} | {rho_pe_mac:+.3f} (p={p_pe_mac:.4f}) | {rho_pe_bis:+.3f} (p={p_pe_bis:.4f}) | {pe_ms:.3f} ms")
-    print(f"{'Commercial BIS ( Ground)':<24} | {pk_bis_mac:<10.3f} | {'--':<19} | {'1.000 (Reference)':<19} | {'Proprietary'}")
-    print("=" * 95)
-    print(f"Speedup Factor: DisEn is {pe_ms / disen_ms:.2f}x faster than PE per 20-second epoch.")
-    print(f"Mean EMG Shift (40Hz - 30Hz): DisEn = {np.mean(emg_disen):+.4f} (+/-{np.std(emg_disen):.4f}) | PE = {np.mean(emg_pe):+.4f} (+/-{np.std(emg_pe):.4f})")
-    print("=" * 95 + "\n")
-
-    # Generate Publication-Ready 3-Panel Comparison Figure
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-    # Panel A: DisEn vs MAC
-    axes[0].scatter(mac, disen_30_vals, c='#1f77b4', s=55, alpha=0.85, edgecolors='k', label='DisEn (30 Hz)')
-    m_fit, b_fit = np.polyfit(mac, disen_30_vals, 1)
-    x_line = np.linspace(min(mac), max(mac), 100)
-    axes[0].plot(x_line, m_fit * x_line + b_fit, 'r--', lw=2, label=f'Fit (r={rho_disen_mac:.3f}, p={p_disen_mac:.4f})')
-    axes[0].set_title(f"A. Dispersion Entropy vs. MAC\n(P_K = {pk_disen_mac:.3f}, p = {p_disen_mac:.4f})", fontweight='bold')
-    axes[0].set_xlabel("Volatile Anesthetic Depth (MAC)")
-    axes[0].set_ylabel("Normalized DisEn (m=3, c=4, d=1)")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
-
-    # Panel B: PE vs MAC
-    axes[1].scatter(mac, pe_30_vals, c='#ff7f0e', s=55, alpha=0.85, edgecolors='k', label='PE (30 Hz)')
-    m_pe, b_pe = np.polyfit(mac, pe_30_vals, 1)
-    axes[1].plot(x_line, m_pe * x_line + b_pe, 'k--', lw=2, label=f'Fit (r={rho_pe_mac:.3f}, p={p_pe_mac:.4f})')
-    axes[1].set_title(f"B. Permutation Entropy vs. MAC\n(P_K = {pk_pe_mac:.3f}, p = {p_pe_mac:.4f})", fontweight='bold')
-    axes[1].set_xlabel("Volatile Anesthetic Depth (MAC)")
-    axes[1].set_ylabel("Normalized PE (m=3, d=1)")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
-
-    # Panel C: Computational Latency & Prediction Accuracy Comparison
-    x_pos = np.arange(2)
-    ax_twin = axes[2].twinx()
-    b1 = axes[2].bar(x_pos - 0.18, [pk_disen_mac, pk_pe_mac], width=0.32, color=['#1f77b4', '#ff7f0e'], alpha=0.85, edgecolor='k', label='Prediction Prob (P_K)')
-    b2 = ax_twin.bar(x_pos + 0.18, [disen_ms, pe_ms], width=0.32, color=['#aec7e8', '#ffbb78'], alpha=0.85, edgecolor='k', hatch='//', label='Latency (ms/epoch)')
-    axes[2].axhline(0.5, color='gray', linestyle=':', label='Chance (P_K = 0.50)')
-    axes[2].set_xticks(x_pos)
-    axes[2].set_xticklabels(['DisEn\n(m=3, c=4)', 'PE\n(m=3)'])
-    axes[2].set_ylim(0.4, 0.85)
-    axes[2].set_ylabel("Prediction Probability (P_K)")
-    ax_twin.set_ylabel("Execution Time per 20s Epoch (ms)")
-    axes[2].set_title("C. Accuracy (P_K) vs. Computational Cost", fontweight='bold')
-    axes[2].grid(True, axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    os.makedirs("figures", exist_ok=True)
-    plt.savefig("figures/disen_vs_pe_comparison.png", dpi=300)
-    print("[*] Saved figure to 'figures/disen_vs_pe_comparison.png' and data to 'data/stratified_cohort_with_pe.csv'.")
+    print("\n" + "=" * 105)
+    print(f"UPDATED HEAD-TO-HEAD BENCHMARK (MAC <= 2.0, N = {len(df_strat)} PLATEAUS)")
+    print("=" * 105)
+    print(f"{'Metric (0.5-30 Hz)':<24} | {'P_K (MAC) [95% CI]':<22} | {'Spearman r (MAC)':<18} | {'Spearman r (BIS)':<18} | {'EMG Shift'}")
+    print("-" * 105)
+    print(f"{'DispEn (m=3, c=4, d=1)':<24} | {pk_disp:.3f} [{ci_disp_l:.3f}-{ci_disp_u:.3f}]  | {rho_disp_mac:+.3f} (p={p_disp_mac:.4f})  | {rho_disp_bis:+.3f} (p={p_disp_bis:.4f})  | {np.mean(emg_disp):+.4f}")
+    print(f"{'PeEn   (m=3, d=1)':<24} | {pk_peen:.3f} [{ci_peen_l:.3f}-{ci_peen_u:.3f}]  | {rho_peen_mac:+.3f} (p={p_peen_mac:.4f})  | {'--':<18}  | {np.mean(emg_peen):+.4f}")
+    print(f"{'SampEn (m=2, r=0.2)':<24} | {pk_samp:.3f} [{ci_samp_l:.3f}-{ci_samp_u:.3f}]  | {rho_samp_mac:+.3f} (p={p_samp_mac:.4f})  | {'--':<18}  | --")
+    print(f"{'Commercial BIS':<24} | {pk_bis:.3f} [{ci_bis_l:.3f}-{ci_bis_u:.3f}]  | {'--':<18}  | 1.000 (Reference)    | Proprietary")
+    print("=" * 105 + "\n")
+  
